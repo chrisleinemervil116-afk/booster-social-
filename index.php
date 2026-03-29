@@ -1,328 +1,259 @@
 <?php
-require 'config.php';
+require __DIR__ . '/config.php';
+setLanguageFromRequest();
+$pdo = pdo();
+$user = currentUser();
+$view = $_GET['view'] ?? ($user ? 'dashboard' : 'home');
+$message = '';
+$error = '';
 
-$msg = "";
-$orderId = "";
-
-// Helper pour les icônes (Logique visuelle)
-function getServiceIcon($cat) {
-    $cat = strtolower($cat);
-    if (strpos($cat, 'instagram') !== false) return ['fab fa-instagram', 'text-pink-500', 'bg-pink-500/10'];
-    if (strpos($cat, 'facebook') !== false) return ['fab fa-facebook-f', 'text-blue-600', 'bg-blue-600/10'];
-    if (strpos($cat, 'tiktok') !== false) return ['fab fa-tiktok', 'text-white', 'bg-white/10'];
-    if (strpos($cat, 'youtube') !== false) return ['fab fa-youtube', 'text-red-500', 'bg-red-500/10'];
-    if (strpos($cat, 'twitter') !== false || strpos($cat, 'x ') !== false) return ['fab fa-x-twitter', 'text-slate-300', 'bg-slate-500/10'];
-    if (strpos($cat, 'telegram') !== false) return ['fab fa-telegram-plane', 'text-blue-400', 'bg-blue-400/10'];
-    return ['fas fa-bolt', 'text-amber-400', 'bg-amber-400/10'];
+if (isset($_GET['logout'])) {
+    session_destroy();
+    header('Location: index.php');
+    exit;
 }
 
-// Récupération des services
-if ($demoMode) {
-    $services = $_SESSION['demo_services'] ?? [];
-} else {
-    try {
-        $services = $pdo->query("SELECT * FROM services WHERE active = 1 ORDER BY category")->fetchAll(PDO::FETCH_ASSOC);
-    } catch (Exception $e) {
-        $services = [];
-    }
-}
-
-// Grouper les services par catégorie pour le Modal
-$groupedServices = [];
-foreach ($services as $s) {
-    $groupedServices[$s['category']][] = $s;
-}
-
-// --- TRAITEMENT COMMANDE ---
-if (isset($_POST['order'])) {
-    $serviceId = $_POST['service_id'];
-    $link = $_POST['link'];
-    $qty = $_POST['quantity'];
-
-    // Recherche du service pour obtenir les infos
-    $service = null;
-    foreach ($services as $s) { if ($s['id'] == $serviceId) { $service = $s; break; } }
-
-    if ($service) {
-        if ($demoMode) {
-            // --- SCÉNARIO DÉMO : ON SIMULE ---
-            $msg = "demo_success";
-            $orderId = rand(10000, 99999);
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    if (isset($_POST['register'])) {
+        $name = trim($_POST['full_name'] ?? '');
+        $email = strtolower(trim($_POST['email'] ?? ''));
+        $password = $_POST['password'] ?? '';
+        if ($name === '' || !filter_var($email, FILTER_VALIDATE_EMAIL) || strlen($password) < 6) {
+            $error = 'Informations invalides.';
         } else {
-            // --- SCÉNARIO PRODUCTION ---
-            $apiResult = callBlessPanel('add', [
-                'service' => $service['provider_service_id'],
-                'link' => $link,
-                'quantity' => $qty
-            ]);
+            try {
+                $stmt = $pdo->prepare('INSERT INTO users(full_name, email, password_hash, balance, role, language) VALUES (?, ?, ?, 0, "user", ?)');
+                $stmt->execute([$name, $email, password_hash($password, PASSWORD_DEFAULT), $_SESSION['lang'] ?? 'fr']);
+                $message = 'Compte créé, connectez-vous.';
+                $view = 'login';
+            } catch (PDOException $e) {
+                $error = 'Email déjà utilisé.';
+            }
+        }
+    }
 
-            if (isset($apiResult['order'])) {
-                $price = ($qty/1000) * $service['rate'];
-                $stmtInsert = $pdo->prepare("INSERT INTO orders (service_id, link, quantity, price, status, provider_order_id) VALUES (?, ?, ?, ?, ?, ?)");
-                $stmtInsert->execute([$service['id'], $link, $qty, $price, 'Pending', $apiResult['order']]);
-                
-                $msg = "real_success";
-                $orderId = $apiResult['order'];
+    if (isset($_POST['login'])) {
+        $email = strtolower(trim($_POST['email'] ?? ''));
+        $password = $_POST['password'] ?? '';
+        $stmt = $pdo->prepare('SELECT * FROM users WHERE email = ?');
+        $stmt->execute([$email]);
+        $found = $stmt->fetch();
+        if ($found && password_verify($password, $found['password_hash'])) {
+            $_SESSION['user_id'] = $found['id'];
+            $_SESSION['lang'] = $found['language'] ?: ($_SESSION['lang'] ?? 'fr');
+            header('Location: ' . ($found['role'] === 'admin' ? 'admin.php' : 'index.php?view=dashboard'));
+            exit;
+        }
+        $error = 'Identifiants invalides.';
+    }
+
+    if (isset($_POST['add_funds'])) {
+        $u = requireLogin();
+        $method = $_POST['method'] ?? 'MonCash';
+        $amount = (float)($_POST['amount'] ?? 0);
+        if ($amount <= 0) {
+            $error = 'Montant invalide.';
+        } else {
+            $stmt = $pdo->prepare('INSERT INTO transactions(user_id, method, amount, status, note) VALUES (?, ?, ?, "Pending", ?)');
+            $stmt->execute([$u['id'], $method, $amount, 'Demande de dépôt']);
+            $pdo->prepare('INSERT INTO notifications(user_id,title,message) VALUES (?, ?, ?)')->execute([$u['id'], 'Demande de dépôt', 'Votre dépôt est en attente de validation admin.']);
+            $message = 'Demande de dépôt envoyée.';
+        }
+    }
+
+    if (isset($_POST['place_order'])) {
+        $u = requireLogin();
+        $serviceId = (int)($_POST['service_id'] ?? 0);
+        $link = trim($_POST['link'] ?? '');
+        $quantity = (int)($_POST['quantity'] ?? 0);
+        $stmt = $pdo->prepare('SELECT * FROM services WHERE id = ? AND active = 1');
+        $stmt->execute([$serviceId]);
+        $service = $stmt->fetch();
+        if (!$service) {
+            $error = 'Service introuvable.';
+        } elseif ($quantity < $service['min_qty'] || $quantity > $service['max_qty']) {
+            $error = 'Quantité hors limites.';
+        } else {
+            $total = ($quantity / 1000) * (float)$service['rate'];
+            if ((float)$u['balance'] < $total) {
+                $error = 'Solde insuffisant.';
+            } elseif (!isValidServiceLink($link, expectedLinkType($service))) {
+                $error = expectedLinkType($service) === 'video'
+                    ? 'Ce service demande un lien de vidéo (post/reel/short/watch).'
+                    : 'Ce service demande un lien de compte/profil, pas un lien vidéo.';
             } else {
-                $msg = "error";
-                $errorText = $apiResult['error'] ?? "Erreur inconnue";
+                $provider = providerRequest('add', ['service' => $service['provider_service_id'], 'link' => $link, 'quantity' => $quantity]);
+                $providerOrderId = $provider['order'] ?? null;
+                $status = isset($provider['error']) ? 'Pending Provider' : 'Processing';
+                $pdo->prepare('INSERT INTO orders(user_id, service_id, link, quantity, total, status, provider_order_id) VALUES (?, ?, ?, ?, ?, ?, ?)')
+                    ->execute([$u['id'], $serviceId, $link, $quantity, $total, $status, $providerOrderId]);
+                $pdo->prepare('UPDATE users SET balance = balance - ? WHERE id = ?')->execute([$total, $u['id']]);
+                $pdo->prepare('INSERT INTO notifications(user_id,title,message) VALUES (?, ?, ?)')->execute([$u['id'], 'Nouvelle commande', 'Commande créée avec succès.']);
+                $message = 'Commande créée avec succès.';
             }
         }
     }
 }
+
+$user = currentUser();
+$services = $pdo->query('SELECT * FROM services WHERE active = 1 ORDER BY category, name')->fetchAll();
+$orders = $user ? $pdo->prepare('SELECT o.*, s.name service_name FROM orders o JOIN services s ON s.id=o.service_id WHERE o.user_id=? ORDER BY o.id DESC LIMIT 20') : null;
+if ($orders) { $orders->execute([$user['id']]); $orders = $orders->fetchAll(); }
+$transactions = $user ? $pdo->prepare('SELECT * FROM transactions WHERE user_id=? ORDER BY id DESC LIMIT 20') : null;
+if ($transactions) { $transactions->execute([$user['id']]); $transactions = $transactions->fetchAll(); }
+$notifications = $user ? $pdo->prepare('SELECT * FROM notifications WHERE user_id=? ORDER BY id DESC LIMIT 10') : null;
+if ($notifications) { $notifications->execute([$user['id']]); $notifications = $notifications->fetchAll(); }
 ?>
-<!DOCTYPE html>
+<!doctype html>
 <html lang="fr" class="dark">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
-    <title>SocialBooster - Boutique</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-    <script>
-        tailwind.config = { darkMode: 'class', theme: { extend: { colors: { dark: '#020617', panel: '#0f172a', primary: '#6366f1' } } } }
-    </script>
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
-    <style>
-        .scrollbar-hide::-webkit-scrollbar { display: none; }
-        .service-card:hover { transform: translateY(-2px); border-color: #6366f1; }
-        .modal-enter { animation: slideUp 0.3s cubic-bezier(0.16, 1, 0.3, 1) forwards; }
-        @keyframes slideUp { from { transform: translateY(100%); opacity: 0; } to { transform: translateY(0); opacity: 1; } }
-    </style>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title><?= SITE_NAME ?></title>
+<script src="https://cdn.tailwindcss.com"></script>
+<style>body{background:#050505}.card{background:#111;border:1px solid #2a2a2a}.accent{color:#ff8a00}.btn{background:#ff8a00;color:#000;font-weight:700}</style>
 </head>
-<body class="bg-dark text-slate-200 font-sans min-h-screen flex flex-col relative overflow-x-hidden selection:bg-primary/30">
-
-    <nav class="border-b border-white/5 bg-panel/80 backdrop-blur-md sticky top-0 z-40">
-        <div class="max-w-md mx-auto px-6 h-16 flex items-center justify-between">
-            <div class="font-bold text-lg tracking-tight text-white flex items-center gap-2">
-                <div class="w-8 h-8 rounded-lg bg-gradient-to-tr from-primary to-purple-500 flex items-center justify-center shadow-lg shadow-primary/20">
-                    <i class="fas fa-fire text-white text-sm"></i>
-                </div>
-                SocialBooster
-            </div>
-            <?php if($demoMode): ?>
-                <span class="text-[10px] font-bold bg-yellow-500/10 text-yellow-500 px-2 py-1 rounded border border-yellow-500/20">
-                    DÉMO
-                </span>
-            <?php endif; ?>
-        </div>
-    </nav>
-
-    <main class="flex-grow px-4 py-6 w-full max-w-md mx-auto">
-        
-        <div class="bg-gradient-to-r from-blue-600/10 to-purple-600/10 border border-blue-500/20 rounded-2xl p-5 mb-8 text-center relative overflow-hidden group">
-            <div class="absolute top-0 right-0 p-3 opacity-10 text-5xl text-blue-500"><i class="fas fa-code-branch"></i></div>
-            
-            <div class="relative z-10">
-                <span class="inline-block py-1 px-3 rounded-full bg-blue-500/20 text-blue-400 text-[10px] font-bold uppercase tracking-wider mb-2 border border-blue-500/30">
-                    Note pour les développeurs
-                </span>
-                
-                <h2 class="text-lg font-bold text-white mb-2">
-                    Ceci est le site de vos clients !
-                </h2>
-                
-                <p class="text-xs text-slate-300 leading-relaxed mb-4">
-                    Les prix affichés ici incluent une marge d'exemple (ex: <b>+20%</b> ou <b>+50%</b>).
-                    <br>En tant qu'admin, vous définissez librement ce pourcentage.
-                </p>
-
-                <a href="admin.php" class="inline-flex items-center gap-2 px-5 py-2.5 bg-blue-600 hover:bg-blue-500 text-white text-xs font-bold rounded-xl transition shadow-lg shadow-blue-600/20">
-                    <i class="fas fa-user-shield"></i> Voir le Panel Admin
-                </a>
-            </div>
-        </div>
-
-        <div class="text-center mb-8">
-            <h1 class="text-3xl font-extrabold text-white mb-2">Passez votre <br><span class="text-transparent bg-clip-text bg-gradient-to-r from-primary to-purple-400">Commande</span></h1>
-            <p class="text-sm text-slate-400">Sélectionnez un service pour commencer.</p>
-        </div>
-
-        <?php if($msg == 'demo_success'): ?>
-            <div class="bg-blue-500/10 border border-blue-500/20 rounded-2xl p-5 mb-6 text-center animate-pulse">
-                <div class="w-12 h-12 bg-blue-500/20 text-blue-400 rounded-full flex items-center justify-center mx-auto mb-3 text-xl">
-                    <i class="fas fa-info"></i>
-                </div>
-                <h3 class="text-white font-bold text-lg mb-1">Simulation Réussie</h3>
-                <p class="text-sm text-blue-300 mb-2">Cette commande n'a pas été exécutée car le site est en <b>Mode Démo</b>.</p>
-                <p class="text-xs text-slate-500">En production, la commande serait envoyée instantanément via l'API.</p>
-            </div>
-        <?php elseif($msg == 'real_success'): ?>
-            <div class="bg-emerald-500/10 border border-emerald-500/20 rounded-2xl p-5 mb-6 text-center">
-                <div class="w-12 h-12 bg-emerald-500/20 text-emerald-400 rounded-full flex items-center justify-center mx-auto mb-3 text-xl"><i class="fas fa-check"></i></div>
-                <h3 class="text-white font-bold text-lg">Commande #<?php echo $orderId; ?> Reçue !</h3>
-                <p class="text-sm text-slate-400">Livraison en cours.</p>
-            </div>
-        <?php elseif($msg == 'error'): ?>
-            <div class="bg-red-500/10 border border-red-500/20 rounded-2xl p-5 mb-6 text-center">
-                <h3 class="text-red-400 font-bold">Erreur</h3>
-                <p class="text-sm text-slate-400"><?php echo $errorText; ?></p>
-            </div>
-        <?php endif; ?>
-
-        <div class="bg-panel border border-white/10 rounded-3xl p-6 shadow-2xl relative">
-            <form method="POST" class="space-y-6">
-                <input type="hidden" name="service_id" id="input_service_id" required>
-                
-                <div class="space-y-2">
-                    <label class="text-xs font-bold text-slate-400 uppercase ml-1">Service</label>
-                    <div onclick="openServicesModal()" class="w-full bg-dark border border-slate-600 hover:border-primary text-white rounded-xl px-4 py-4 flex justify-between items-center cursor-pointer transition group">
-                        <span id="selected_service_name" class="text-sm text-slate-400 truncate">Cliquez pour choisir...</span>
-                        <i class="fas fa-chevron-right text-slate-600 group-hover:text-primary transition"></i>
-                    </div>
-                    
-                    <div id="service_info_box" class="hidden mt-3 space-y-3">
-                        <div class="flex gap-3 text-xs">
-                            <div class="bg-white/5 border border-white/5 px-3 py-1.5 rounded-lg text-slate-300">
-                                Min: <span id="info_min" class="font-bold text-white">100</span>
-                            </div>
-                            <div class="bg-white/5 border border-white/5 px-3 py-1.5 rounded-lg text-slate-300">
-                                Max: <span id="info_max" class="font-bold text-white">10000</span>
-                            </div>
-                        </div>
-                        <div class="text-xs text-slate-400 bg-primary/5 p-3 rounded-xl border border-primary/10 leading-relaxed" id="info_desc"></div>
-                    </div>
-                </div>
-
-                <div class="space-y-2">
-                    <label class="text-xs font-bold text-slate-400 uppercase ml-1">Lien</label>
-                    <div class="relative">
-                        <input type="url" name="link" placeholder="https://..." class="w-full bg-dark border border-slate-600 text-white rounded-xl pl-10 pr-4 py-4 focus:border-primary outline-none transition text-sm">
-                        <i class="fas fa-link absolute left-4 top-1/2 -translate-y-1/2 text-slate-500"></i>
-                    </div>
-                </div>
-
-                <div class="space-y-2">
-                    <label class="text-xs font-bold text-slate-400 uppercase ml-1">Quantité</label>
-                    <div class="relative">
-                        <input type="number" name="quantity" id="quantity" placeholder="Ex: 1000" class="w-full bg-dark border border-slate-600 text-white rounded-xl pl-10 pr-4 py-4 focus:border-primary outline-none transition text-sm" oninput="calcPrice()">
-                        <i class="fas fa-sort-numeric-up absolute left-4 top-1/2 -translate-y-1/2 text-slate-500"></i>
-                    </div>
-                    <div class="text-right text-xs text-slate-400 font-mono mt-1">
-                        Coût total : <span id="totalPrice" class="text-white font-bold text-base">$0.00</span>
-                    </div>
-                </div>
-
-                <button type="submit" name="order" class="w-full bg-primary hover:bg-indigo-600 text-white font-bold py-4 rounded-xl transition-all shadow-lg shadow-primary/25 flex items-center justify-center gap-2 mt-4 group">
-                    <span><?php echo $demoMode ? 'Simuler la Commande' : 'Commander'; ?></span> 
-                    <i class="fas fa-arrow-right transform group-hover:translate-x-1 transition-transform"></i>
-                </button>
-            </form>
-        </div>
-    </main>
-
-    <div id="servicesModal" class="fixed inset-0 z-50 bg-black/90 backdrop-blur-sm hidden flex-col">
-        <div class="flex items-center justify-between p-4 border-b border-white/10 bg-panel/90 backdrop-blur">
-            <h2 class="text-white font-bold text-lg">Services</h2>
-            <button onclick="closeServicesModal()" class="w-8 h-8 rounded-full bg-white/10 flex items-center justify-center text-white hover:bg-white/20 transition"><i class="fas fa-times"></i></button>
-        </div>
-
-        <div class="p-4 bg-panel border-b border-white/5">
-            <div class="relative">
-                <i class="fas fa-search absolute left-4 top-1/2 -translate-y-1/2 text-slate-500"></i>
-                <input type="text" id="serviceSearch" onkeyup="filterServices()" placeholder="Rechercher (ex: Instagram)..." class="w-full bg-dark border border-slate-700 text-white rounded-xl pl-10 pr-4 py-3 text-sm focus:border-primary outline-none">
-            </div>
-        </div>
-
-        <div class="flex-grow overflow-y-auto p-4 space-y-6" id="servicesList">
-            <?php foreach($groupedServices as $catName => $catServices): 
-                $iconData = getServiceIcon($catName);
-            ?>
-            <div class="service-category">
-                <div class="flex items-center gap-2 mb-3 text-white font-bold text-sm uppercase tracking-wide opacity-80 sticky top-0 bg-black/50 backdrop-blur py-2 z-10">
-                    <i class="<?php echo $iconData[0] . ' ' . $iconData[1]; ?>"></i> <?php echo $catName; ?>
-                </div>
-                <div class="space-y-2">
-                    <?php foreach($catServices as $s): ?>
-                    <div onclick='selectService(<?php echo json_encode($s); ?>)' class="service-item bg-white/5 border border-white/5 rounded-xl p-4 cursor-pointer hover:bg-white/10 transition active:scale-95" data-search="<?php echo strtolower($s['name'] . ' ' . $s['category']); ?>">
-                        <div class="flex justify-between items-start gap-3">
-                            <div class="flex-1">
-                                <h4 class="text-sm font-semibold text-white leading-tight mb-1"><?php echo $s['name']; ?></h4>
-                                <div class="flex items-center gap-2 text-[10px] text-slate-400">
-                                    <span class="bg-black/30 px-2 py-0.5 rounded">ID: <?php echo $s['provider_service_id']; ?></span>
-                                    <span>Min: <?php echo $s['min']; ?></span>
-                                </div>
-                            </div>
-                            <div class="text-right">
-                                <div class="text-emerald-400 font-mono font-bold text-sm">$<?php echo $s['rate']; ?></div>
-                                <div class="text-[10px] text-slate-500">/1000</div>
-                            </div>
-                        </div>
-                    </div>
-                    <?php endforeach; ?>
-                </div>
-            </div>
-            <?php endforeach; ?>
-            
-            <div id="noResults" class="hidden text-center py-10 text-slate-500">
-                <i class="fas fa-ghost text-3xl mb-2"></i><br>Aucun service trouvé.
-            </div>
-        </div>
+<body class="text-white min-h-screen">
+<header class="sticky top-0 z-30 bg-black/80 border-b border-orange-500/20 backdrop-blur">
+  <div class="max-w-6xl mx-auto px-4 py-3 flex items-center justify-between">
+    <div>
+      <h1 class="font-extrabold text-xl"><?= SITE_NAME ?></h1>
+      <p class="text-xs text-orange-300"><?= t('tagline') ?></p>
     </div>
+    <div class="flex items-center gap-2 text-sm">
+      <a class="px-2 py-1 border rounded border-orange-500/50" href="?lang=fr">FR</a>
+      <a class="px-2 py-1 border rounded border-orange-500/50" href="?lang=ht">HT</a>
+      <?php if($user): ?>
+        <a class="px-3 py-1 border rounded border-orange-500/50" href="?view=dashboard"><?= t('dashboard') ?></a>
+        <?php if($user['role']==='admin'): ?><a class="px-3 py-1 border rounded border-orange-500/50" href="admin.php">Admin</a><?php endif; ?>
+        <a class="px-3 py-1 btn rounded" href="?logout=1"><?= t('logout') ?></a>
+      <?php else: ?>
+        <a class="px-3 py-1 border rounded border-orange-500/50" href="?view=login"><?= t('login') ?></a>
+        <a class="px-3 py-1 btn rounded" href="?view=register"><?= t('register') ?></a>
+      <?php endif; ?>
+    </div>
+  </div>
+</header>
 
-    <script>
-        let currentRate = 0;
+<main class="max-w-6xl mx-auto p-4 grid gap-4">
+  <?php if($message): ?><div class="bg-emerald-900/40 border border-emerald-500 p-3 rounded"><?= htmlspecialchars($message) ?></div><?php endif; ?>
+  <?php if($error): ?><div class="bg-red-900/40 border border-red-500 p-3 rounded"><?= htmlspecialchars($error) ?></div><?php endif; ?>
 
-        function openServicesModal() {
-            document.getElementById('servicesModal').classList.remove('hidden');
-            document.getElementById('servicesModal').classList.add('flex', 'modal-enter');
-            document.body.style.overflow = 'hidden'; 
-        }
+  <?php if(!$user && $view === 'home'): ?>
+    <section class="card rounded-2xl p-8 text-center">
+      <h2 class="text-4xl font-black mb-2"><?= SITE_NAME ?></h2>
+      <p class="text-slate-300 mb-4"><?= t('welcome') ?></p>
+      <div class="flex justify-center gap-3"><a href="?view=register" class="btn px-4 py-2 rounded-lg"><?= t('register') ?></a><a href="?view=login" class="px-4 py-2 rounded-lg border border-orange-500/50"><?= t('login') ?></a></div>
+      <a href="<?= WHATSAPP_URL ?>" class="inline-block mt-6 text-orange-400 underline">WhatsApp Support</a>
+    </section>
+  <?php endif; ?>
 
-        function closeServicesModal() {
-            document.getElementById('servicesModal').classList.add('hidden');
-            document.getElementById('servicesModal').classList.remove('flex', 'modal-enter');
-            document.body.style.overflow = '';
-        }
+  <?php if(!$user && $view === 'login'): ?>
+    <form method="post" class="card max-w-lg mx-auto rounded-2xl p-6 grid gap-3">
+      <h3 class="text-2xl font-bold"><?= t('login') ?></h3>
+      <input class="bg-black border border-zinc-700 p-3 rounded" name="email" type="email" placeholder="Email" required />
+      <input class="bg-black border border-zinc-700 p-3 rounded" name="password" type="password" placeholder="Password" required />
+      <button class="btn rounded p-3" name="login"><?= t('login') ?></button>
+    </form>
+  <?php endif; ?>
 
-        function selectService(service) {
-            document.getElementById('input_service_id').value = service.id;
-            document.getElementById('selected_service_name').innerText = service.name;
-            document.getElementById('selected_service_name').classList.remove('text-slate-400');
-            document.getElementById('selected_service_name').classList.add('text-white', 'font-bold');
-            
-            document.getElementById('service_info_box').classList.remove('hidden');
-            document.getElementById('info_min').innerText = service.min;
-            document.getElementById('info_max').innerText = service.max;
-            document.getElementById('info_desc').innerText = service.description || "Aucune description disponible.";
-            
-            currentRate = parseFloat(service.rate);
-            calcPrice();
-            closeServicesModal();
-        }
+  <?php if(!$user && $view === 'register'): ?>
+    <form method="post" class="card max-w-lg mx-auto rounded-2xl p-6 grid gap-3">
+      <h3 class="text-2xl font-bold"><?= t('register') ?></h3>
+      <input class="bg-black border border-zinc-700 p-3 rounded" name="full_name" placeholder="Nom complet" required />
+      <input class="bg-black border border-zinc-700 p-3 rounded" name="email" type="email" placeholder="Email" required />
+      <input class="bg-black border border-zinc-700 p-3 rounded" name="password" type="password" placeholder="Mot de passe (min 6)" required />
+      <button class="btn rounded p-3" name="register"><?= t('register') ?></button>
+    </form>
+  <?php endif; ?>
 
-        function calcPrice() {
-            const qty = parseInt(document.getElementById('quantity').value) || 0;
-            if(qty > 0 && currentRate > 0) {
-                const total = (qty / 1000) * currentRate;
-                document.getElementById('totalPrice').innerText = "$" + total.toFixed(4);
-                document.getElementById('totalPrice').classList.add('text-emerald-400');
-            } else {
-                document.getElementById('totalPrice').innerText = "$0.00";
-                document.getElementById('totalPrice').classList.remove('text-emerald-400');
-            }
-        }
+  <?php if($user && $view === 'dashboard'): ?>
+    <section class="grid md:grid-cols-3 gap-4">
+      <div class="card rounded-xl p-4"><p class="text-slate-400 text-sm"><?= t('balance') ?></p><p class="text-3xl font-black accent"><?= money((float)$user['balance']) ?></p></div>
+      <div class="card rounded-xl p-4"><p class="text-slate-400 text-sm"><?= t('orders') ?></p><p class="text-3xl font-black accent"><?= count($orders) ?></p></div>
+      <div class="card rounded-xl p-4"><p class="text-slate-400 text-sm"><?= t('notifications') ?></p><p class="text-3xl font-black accent"><?= count($notifications) ?></p></div>
+    </section>
 
-        function filterServices() {
-            const query = document.getElementById('serviceSearch').value.toLowerCase();
-            const items = document.querySelectorAll('.service-item');
-            let visibleCount = 0;
+    <section class="card rounded-2xl p-5">
+      <h3 class="text-xl font-bold mb-3"><?= t('place_order') ?></h3>
+      <form method="post" class="grid md:grid-cols-4 gap-3 items-end">
+        <div class="md:col-span-2"><label class="text-xs">Service</label><select id="serviceSelect" name="service_id" class="w-full bg-black border border-zinc-700 rounded p-3"><?php foreach($services as $s): ?><option data-link-type="<?= expectedLinkType($s) ?>" value="<?= $s['id'] ?>"><?= htmlspecialchars($s['name']) ?> (<?= money((float)$s['rate']) ?>/1k)</option><?php endforeach; ?></select></div>
+        <div><label class="text-xs">Quantité</label><input name="quantity" type="number" min="1" class="w-full bg-black border border-zinc-700 rounded p-3" required /></div>
+        <div><label class="text-xs">Lien</label><input id="linkInput" name="link" type="url" class="w-full bg-black border border-zinc-700 rounded p-3" placeholder="https://..." required /><p id="linkHint" class="text-[11px] text-orange-300 mt-1">Entrez le lien demandé par le service.</p></div>
+        <button class="btn rounded p-3 md:col-span-4" name="place_order"><?= t('place_order') ?></button>
+      </form>
+    </section>
 
-            items.forEach(item => {
-                if(item.getAttribute('data-search').includes(query)) {
-                    item.style.display = 'block';
-                    visibleCount++;
-                } else {
-                    item.style.display = 'none';
-                }
-            });
+    <section class="grid md:grid-cols-2 gap-4">
+      <div class="card rounded-2xl p-5">
+        <h3 class="font-bold mb-2"><?= t('add_funds') ?></h3>
+        <form method="post" class="grid gap-2">
+          <select name="method" class="bg-black border border-zinc-700 p-3 rounded"><option>MonCash</option><option>NatCash</option><option>Bitcoin</option><option>USDT</option></select>
+          <input name="amount" type="number" step="0.01" placeholder="Montant" class="bg-black border border-zinc-700 p-3 rounded" required />
+          <button class="btn p-3 rounded" name="add_funds"><?= t('add_funds') ?></button>
+        </form>
+      </div>
+      <div class="card rounded-2xl p-5">
+        <h3 class="font-bold mb-2"><?= t('notifications') ?></h3>
+        <ul class="space-y-2 text-sm max-h-56 overflow-auto"><?php foreach($notifications as $n): ?><li class="border border-zinc-800 rounded p-2"><b><?= htmlspecialchars($n['title']) ?></b><br><?= htmlspecialchars($n['message']) ?></li><?php endforeach; ?></ul>
+      </div>
+    </section>
 
-            document.querySelectorAll('.service-category').forEach(cat => {
-                const visibleItems = cat.querySelectorAll('.service-item[style="display: block;"]');
-                cat.style.display = (visibleItems.length > 0 || query === "") ? 'block' : 'none';
-            });
+    <section class="card rounded-2xl p-5 overflow-auto">
+      <h3 class="font-bold mb-2"><?= t('history') ?></h3>
+      <table class="w-full text-sm"><tr class="text-left text-orange-300"><th>#</th><th>Service</th><th>Qté</th><th>Total</th><th>Status</th></tr>
+      <?php foreach($orders as $o): ?><tr><td><?= $o['id'] ?></td><td><?= htmlspecialchars($o['service_name']) ?></td><td><?= $o['quantity'] ?></td><td><?= money((float)$o['total']) ?></td><td><?= htmlspecialchars($o['status']) ?></td></tr><?php endforeach; ?>
+      </table>
+    </section>
+  <?php endif; ?>
+</main>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<script>
+const serviceSelect = document.getElementById('serviceSelect');
+const linkInput = document.getElementById('linkInput');
+const linkHint = document.getElementById('linkHint');
+if (serviceSelect && linkInput && linkHint) {
+  const syncLinkRequirement = () => {
+    const linkType = serviceSelect.options[serviceSelect.selectedIndex]?.dataset?.linkType || 'generic';
+    if (linkType === 'video') {
+      linkInput.placeholder = 'https://.../video | reel | watch | shorts';
+      linkHint.textContent = 'Service vidéo: mettez le lien de la vidéo/post.';
+    } else if (linkType === 'account') {
+      linkInput.placeholder = 'https://.../@compte ou /channel';
+      linkHint.textContent = 'Service abonnés/followers: mettez le lien du compte/profil.';
+    } else {
+      linkInput.placeholder = 'https://...';
+      linkHint.textContent = 'Entrez le lien demandé par le service.';
+    }
+  };
+  syncLinkRequirement();
+  serviceSelect.addEventListener('change', syncLinkRequirement);
+}
 
-            document.getElementById('noResults').style.display = (visibleCount === 0) ? 'block' : 'none';
-        }
-    </script>
+<?php if ($user): ?>
+const supabase = window.supabase.createClient('<?= SUPABASE_URL ?>', '<?= SUPABASE_ANON_KEY ?>');
+const currentUserId = <?= (int)$user['id'] ?>;
+
+supabase
+  .channel('user-notifications-' + currentUserId)
+  .on('postgres_changes', {
+    event: '*',
+    schema: 'public',
+    table: 'notifications',
+    filter: 'user_id=eq.' + currentUserId
+  }, () => window.location.reload())
+  .subscribe();
+
+supabase
+  .channel('user-orders-' + currentUserId)
+  .on('postgres_changes', {
+    event: '*',
+    schema: 'public',
+    table: 'orders',
+    filter: 'user_id=eq.' + currentUserId
+  }, () => window.location.reload())
+  .subscribe();
+<?php endif; ?>
+</script>
 </body>
 </html>
